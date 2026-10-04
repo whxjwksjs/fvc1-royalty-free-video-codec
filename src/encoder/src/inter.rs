@@ -6,6 +6,7 @@
 use fvc1_dec::motion_compensate;
 
 use crate::picture::Picture;
+use crate::rdo::Preset;
 use crate::rdo::{best_q, collect_txs, CostTables};
 
 pub const MV_RANGE: i32 = 64; // integer-pel diamond search range
@@ -89,6 +90,40 @@ fn diamond_search(
     best
 }
 
+/// Hexagonal search (fast preset). 6-point hex pattern, fewer candidates.
+fn hex_search(
+    bx: usize,
+    by: usize,
+    bs: usize,
+    orig: &Picture,
+    ref_pic: &Picture,
+) -> (i32, i32) {
+    let (fw, fh) = (ref_pic.w, ref_pic.h);
+    let mut best = (0i32, 0i32);
+    let mut best_cost = mc_sse(&ref_pic.y, &orig.y, orig.w, bx, by, bs, 0, 0, fw, fh);
+    if best_cost < (bs * bs * 2) as f64 {
+        return best;
+    }
+    for step in [16, 8, 4, 2, 1] {
+        loop {
+            let mut improved = false;
+            for (dx, dy) in [
+                (step, 0), (-step, 0),
+                (step / 2, step), (-step / 2, step),
+                (step / 2, -step), (-step / 2, -step),
+            ] {
+                let cx = (best.0 + dx * 8).clamp(-MV_RANGE * 8, MV_RANGE * 8);
+                let cy = (best.1 + dy * 8).clamp(-MV_RANGE * 8, MV_RANGE * 8);
+                if cx == best.0 && cy == best.1 { continue; }
+                let c = mc_sse(&ref_pic.y, &orig.y, orig.w, bx, by, bs, cx, cy, fw, fh);
+                if c < best_cost { best_cost = c; best = (cx, cy); improved = true; }
+            }
+            if !improved { break; }
+        }
+    }
+    best
+}
+
 /// Full RDO for one inter block at a given MV (tries Q 0-255).
 /// Returns (cost_without_mv_header, q, luma_q, chroma_q).
 fn rdo_at_mv(
@@ -159,20 +194,60 @@ pub fn rdo_inter_block(
     qp: u8,
     ct: &CostTables,
 ) -> InterDecision {
+    rdo_inter_block_preset(bx, by, bs, orig, ref_pic, lambda, qp, ct, Preset::Slow)
+}
+
+pub fn rdo_inter_block_preset(
+    bx: usize,
+    by: usize,
+    bs: usize,
+    orig: &Picture,
+    ref_pic: &Picture,
+    lambda: f64,
+    qp: u8,
+    ct: &CostTables,
+    preset: Preset,
+) -> InterDecision {
     const HEADER_BITS: f64 = 80.0;
-    // 1. integer diamond search (SSE, fast)
-    let (imvx, imvy) = diamond_search(bx, by, bs, orig, ref_pic);
-    // 2. exhaustive 1/8-pel refinement with fixed-Q RD cost (fast)
+    // 1. integer MV search (diamond for slow, hex for fast)
+    let (imvx, imvy) = if preset == Preset::Fast {
+        hex_search(bx, by, bs, orig, ref_pic)
+    } else {
+        diamond_search(bx, by, bs, orig, ref_pic)
+    };
+    // 2. 1/8-pel refinement: exhaustive 17x17 for slow, best-2 for fast
     let mut best_mv = (imvx, imvy);
     let mut best_mv_cost = f64::INFINITY;
-    for dy in -8..=8 {
-        for dx in -8..=8 {
-            let mvx = imvx + dx;
-            let mvy = imvy + dy;
+    if preset == Preset::Fast {
+        let mut candidates = vec![(imvx, imvy)];
+        for dy in -1..=1 {
+            for dx in -1..=1 {
+                if dx == 0 && dy == 0 { continue; }
+                candidates.push((imvx + dx*8, imvy + dy*8));
+            }
+        }
+        let mut scored: Vec<(f64, (i32, i32))> = candidates.into_iter().map(|(mvx, mvy)| {
             let c = cost_at_mv_fixed_q(bx, by, bs, mvx, mvy, qp, orig, ref_pic, lambda, ct);
-            if c < best_mv_cost {
-                best_mv_cost = c;
-                best_mv = (mvx, mvy);
+            (c, (mvx, mvy))
+        }).collect();
+        scored.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+        for &(_, (cmvx, cmvy)) in scored.iter().take(2) {
+            for dy in -4..=4 {
+                for dx in -4..=4 {
+                    let mvx = cmvx + dx;
+                    let mvy = cmvy + dy;
+                    let c = cost_at_mv_fixed_q(bx, by, bs, mvx, mvy, qp, orig, ref_pic, lambda, ct);
+                    if c < best_mv_cost { best_mv_cost = c; best_mv = (mvx, mvy); }
+                }
+            }
+        }
+    } else {
+        for dy in -8..=8 {
+            for dx in -8..=8 {
+                let mvx = imvx + dx;
+                let mvy = imvy + dy;
+                let c = cost_at_mv_fixed_q(bx, by, bs, mvx, mvy, qp, orig, ref_pic, lambda, ct);
+                if c < best_mv_cost { best_mv_cost = c; best_mv = (mvx, mvy); }
             }
         }
     }

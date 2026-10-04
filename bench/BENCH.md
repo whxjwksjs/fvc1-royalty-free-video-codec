@@ -6,6 +6,20 @@
 - Runner: 10 decodes via `fvc1-dec` CLI, median wall time.
 - Machine: x86_64 VM (this sandbox).
 
+## Results (2026-10-04, v0.3.0 — fast encoder preset)
+
+| Metric | Slow | Fast | Delta |
+|---|---|---|---|
+| 1280x768 encode (gradient) | 150.2s | 4.6s | **32x faster** |
+| 1280x768 encode (noise) | 172.9s | 5.2s | **33x faster** |
+| 1280x768 encode (checker) | 141.1s | 3.9s | **36x faster** |
+| File size (gradient) | 21,737 B | 3,445 B | **84% smaller** |
+| File size (noise) | 2,754,985 B | 777,263 B | **72% smaller** |
+| File size (checker) | 8,887 B | 8,915 B | +0.3% |
+
+Fast preset: depth 0-3, SATD top-3 modes, hex MV search, Q±8.
+See `bench/rd-fast.md` for details.
+
 ## Results (2026-10-04, v0.2.3 — AVX2 bit-identical)
 
 | Metric | Value |

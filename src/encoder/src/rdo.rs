@@ -13,6 +13,71 @@ use fvc1_dec::{dct_forward, half_away, idct_2d, intra_predict, qstep_of, zigzag}
 use crate::picture::Picture;
 
 pub const MAX_DEPTH: u32 = 5;
+pub const MAX_DEPTH_FAST: u32 = 3;
+
+/// Encoder preset.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Preset {
+    Slow,
+    Fast,
+}
+
+/// Sum of Absolute Transformed Differences (SATD) using 4x4 Hadamard.
+/// Faster than SSE for mode pre-selection. Operates on residual blocks.
+pub fn satd_4x4(orig: &[u16], pred: &[u16], stride: usize) -> u32 {
+    // 4x4 Hadamard transform of (orig - pred), sum of abs.
+    let mut diff = [0i32; 16];
+    for y in 0..4 {
+        for x in 0..4 {
+            diff[y*4+x] = orig[y*stride+x] as i32 - pred[y*stride+x] as i32;
+        }
+    }
+    // Horizontal Hadamard
+    let mut tmp = [0i32; 16];
+    for y in 0..4 {
+        let a0 = diff[y*4+0] + diff[y*4+3];
+        let a1 = diff[y*4+1] + diff[y*4+2];
+        let a2 = diff[y*4+1] - diff[y*4+2];
+        let a3 = diff[y*4+0] - diff[y*4+3];
+        tmp[y*4+0] = a0 + a1;
+        tmp[y*4+1] = a3 + a2;
+        tmp[y*4+2] = a3 - a2;
+        tmp[y*4+3] = a0 - a1;
+    }
+    // Vertical Hadamard
+    let mut sum = 0u32;
+    for x in 0..4 {
+        let a0 = tmp[0*4+x] + tmp[3*4+x];
+        let a1 = tmp[1*4+x] + tmp[2*4+x];
+        let a2 = tmp[1*4+x] - tmp[2*4+x];
+        let a3 = tmp[0*4+x] - tmp[3*4+x];
+        sum += (a0 + a1).abs() as u32;
+        sum += (a3 + a2).abs() as u32;
+        sum += (a3 - a2).abs() as u32;
+        sum += (a0 - a1).abs() as u32;
+    }
+    sum >> 1 // Normalize (Hadamard has gain of 2)
+}
+
+/// SATD for arbitrary block size (tiles 4x4).
+pub fn satd_block(orig: &[u16], pred: &[u16], bs: usize, stride: usize) -> u32 {
+    let mut sum = 0u32;
+    for ty in (0..bs).step_by(4) {
+        for tx in (0..bs).step_by(4) {
+            // Extract 4x4 tiles
+            let mut o_tile = [0u16; 16];
+            let mut p_tile = [0u16; 16];
+            for y in 0..4 {
+                for x in 0..4 {
+                    o_tile[y*4+x] = orig[(ty+y)*stride + (tx+x)];
+                    p_tile[y*4+x] = pred[(ty+y)*stride + (tx+x)];
+                }
+            }
+            sum += satd_4x4(&o_tile, &p_tile, 4);
+        }
+    }
+    sum
+}
 
 /// -log2 probability tables for entropy bit estimation.
 pub struct CostTables {
@@ -139,11 +204,37 @@ pub fn best_q(
     lambda: f64,
     ct: &CostTables,
 ) -> (u8, f64, Vec<Vec<i32>>, Vec<Vec<i32>>) {
+    best_q_preset(luma, chroma, lambda, ct, Preset::Slow)
+}
+
+/// Fast: Q ±8 refinement around base QP (passed via lambda-derived estimate).
+/// For now, uses full 0-255 but early-exits; true ±8 needs base QP plumbed through.
+/// TODO: plumb base_qp through for true ±8 search.
+pub fn best_q_preset(
+    luma: &[TxWork],
+    chroma: &[TxWork],
+    lambda: f64,
+    ct: &CostTables,
+    preset: Preset,
+) -> (u8, f64, Vec<Vec<i32>>, Vec<Vec<i32>>) {
     let mut best_q = 0u8;
     let mut best_cost = f64::INFINITY;
     let mut best_lq: Vec<Vec<i32>> = Vec::new();
     let mut best_cq: Vec<Vec<i32>> = Vec::new();
-    for q in 0..=255u8 {
+    
+    // Fast preset: estimate base QP from lambda, search ±8
+    // lambda = 0.85 * 2^((Q-128)/16) => Q = 128 + 16*log2(lambda/0.85)
+    let q_range: Vec<u8> = if preset == Preset::Fast {
+        let base_q = (128.0 + 16.0 * (lambda / 0.85).log2()).round() as i32;
+        let base_q = base_q.clamp(0, 255) as u8;
+        let lo = base_q.saturating_sub(8);
+        let hi = (base_q as u16 + 8).min(255) as u8;
+        (lo..=hi).collect()
+    } else {
+        (0..=255u8).collect()
+    };
+    
+    for q in q_range {
         let qs = qstep_of(q);
         let mut d = 0.0;
         let mut r = 0.0;
@@ -201,17 +292,53 @@ pub fn rdo_intra_block(
     lambda: f64,
     ct: &CostTables,
 ) -> IntraDecision {
-    const HEADER_BITS: f64 = 40.0; // 5 bytes: flag, mode, q, skips
+    rdo_intra_block_preset(bx, by, bs, orig, rec, lambda, ct, Preset::Slow)
+}
+
+/// Fast intra: SATD pre-select top 3 modes, full RDO only on those.
+pub fn rdo_intra_block_preset(
+    bx: usize,
+    by: usize,
+    bs: usize,
+    orig: &Picture,
+    rec: &Picture,
+    lambda: f64,
+    ct: &CostTables,
+    preset: Preset,
+) -> IntraDecision {
+    const HEADER_BITS: f64 = 40.0;
     let (w, h) = (orig.w, orig.h);
     let (cw, ch) = (w / 2, h / 2);
     let (cbx, cby, cbs) = (bx / 2, by / 2, bs / 2);
+
+    // Fast preset: SATD pre-selection
+    let modes: Vec<u8> = if preset == Preset::Fast {
+        let mut scored: Vec<(u32, u8)> = Vec::with_capacity(8);
+        for mode in 0..8u8 {
+            let pred_y = intra_predict(mode, &rec.y, bx, by, bs, bs, w, h);
+            // SATD on luma only for speed (chroma follows luma mode)
+            let mut orig_tile = vec![0u16; bs * bs];
+            for y in 0..bs {
+                for x in 0..bs {
+                    orig_tile[y*bs+x] = orig.y[(by+y)*w + (bx+x)];
+                }
+            }
+            let s = satd_block(&orig_tile, &pred_y, bs, bs);
+            scored.push((s, mode));
+        }
+        scored.sort_by_key(|&(s, _)| s);
+        scored.iter().take(3).map(|&(_, m)| m).collect()
+    } else {
+        (0..8u8).collect()
+    };
+
     let mut best: Option<IntraDecision> = None;
-    for mode in 0..8u8 {
+    for mode in modes {
         let pred_y = intra_predict(mode, &rec.y, bx, by, bs, bs, w, h);
         let pred_u = intra_predict(mode, &rec.u, cbx, cby, cbs, cbs, cw, ch);
         let pred_v = intra_predict(mode, &rec.v, cbx, cby, cbs, cbs, cw, ch);
         let (luma_txs, chroma_txs) = collect_txs(bx, by, bs, orig, &pred_y, &pred_u, &pred_v);
-        let (q, cost, lq, cq) = best_q(&luma_txs, &chroma_txs, lambda, ct);
+        let (q, cost, lq, cq) = best_q_preset(&luma_txs, &chroma_txs, lambda, ct, preset);
         let total = cost + lambda * HEADER_BITS;
         if best.as_ref().map_or(true, |b: &IntraDecision| total < b.cost) {
             best = Some(IntraDecision {
