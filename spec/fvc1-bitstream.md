@@ -276,3 +276,101 @@ returns a typed error instead. Minimum obligations:
 
 /* Patent Status: clean-room design; see PATENTS.md and docs/defensive/.
    This is not legal advice. Requires attorney review before release. */
+
+## Appendix A: Integer IDCT (Normative, v0.2.1)
+
+This Appendix defines the exact integer inverse DCT used by FVC1 decoders
+from v0.2.1 onward. It replaces the f64 reference in §7. All operations are
+on signed integers; bit-identical output is required across implementations.
+
+### A.1 Input and Output
+
+- **Input:** Dequantized coefficients `dq[k]` as signed 32-bit integers,
+  obtained by `half_away(qcoeff * qstep)` (round half away from zero).
+  Range: `[-2^20, 2^20]` (enforced by coefficient clipping).
+- **Output:** Spatial residuals `r[n]` as signed 16-bit integers.
+  Range: `[-2^15, 2^15 - 1]` (saturated).
+
+### A.2 1D Integer IDCT
+
+The 1D N-point integer IDCT (N = 4, 8, 16, 32) is defined recursively
+via even-odd decomposition (Loeffler-style factorization).
+
+**Base case (N=4):** Direct matrix multiplication with fixed-point coefficients.
+
+Define `W4[k][n] = round(M4[k][n] * 2^14)` where M4 is the 4-point orthonormal
+DCT-II matrix (§7). The 1D IDCT-4 is:
+
+```
+for n in 0..4:
+    s = 0
+    for k in 0..4:
+        s += W4[k][n] * dq[k]   // 32-bit accumulator
+    r[n] = sat16((s + (1 << 13)) >> 14)   // round, shift, saturate to int16
+```
+
+The `W4` coefficients (row k, column n) are:
+```
+W4 = [
+  [ 8192,  8192,  8192,  8192],  // k=0: sqrt(1/4)*2^14
+  [10703,  4433, -4433,-10703],  // k=1
+  [ 8192, -8192, -8192,  8192],  // k=2
+  [ 4433,-10703, 10703, -4433],  // k=3
+]
+```
+(Values are `round(sqrt(2/4) * c_k * cos(pi*(2n+1)*k/8) * 2^14)`.)
+
+**Recursive case (N=8, 16, 32):** Even-odd decomposition.
+
+Given input `dq[0..N-1]`:
+1. Split: `E[j] = dq[2*j]`, `O[j] = dq[2*j+1]` for j=0..N/2-1.
+2. Compute `a = IDCT_{N/2}(E)` (N/2-point integer IDCT, recursively).
+3. Compute `b = IDCT-IV_{N/2}(O)` (see A.3).
+4. Combine for n=0..N/2-1:
+   ```
+   even = (a[n] + 1) >> 1   // divide by sqrt(2), rounded; see note
+   odd  = (b[n] + 1) >> 1
+   r[n]     = sat16(even + odd)
+   r[N-1-n] = sat16(even - odd)
+   ```
+
+**Note on sqrt(2) scaling:** The even-odd decomposition requires division by
+sqrt(2). We approximate `1/sqrt(2) ≈ 11585/16384` (i.e., `round(2^14 / sqrt(2))`).
+So: `even = (a[n] * 11585 + (1 << 13)) >> 14`.
+
+### A.3 Integer DCT-IV (for odd part)
+
+The (N/2)-point integer DCT-IV is defined via direct matrix multiplication.
+
+Define `V_M[k][n] = round(sqrt(2/M) * cos(pi*(2n+1)*(2k+1)/(4M)) * 2^14)`
+for M = N/2. Then:
+
+```
+for n in 0..M-1:
+    s = 0
+    for k in 0..M-1:
+        s += V_M[k][n] * O[k]
+    b[n] = sat16((s + (1 << 13)) >> 14)
+```
+
+The `V` matrices are precomputed constants (given in the reference implementation).
+
+### A.4 2D Integer IDCT
+
+The 2D N×N integer IDCT applies the 1D IDCT to each row, then to each column.
+Intermediate row results are 16-bit; column IDCT takes 16-bit input.
+
+### A.5 Bit-Exactness Requirements
+
+1. All multiplications use 32-bit signed accumulators.
+2. Rounding is round-half-up: `(s + (1 << (SHIFT-1))) >> SHIFT`.
+3. Right shifts are arithmetic (sign-extending).
+4. Saturation to int16: `sat16(x) = max(-32768, min(32767, x))`.
+5. The order of operations (loop nesting) MUST match the reference implementation.
+6. No floating-point operations are permitted in the IDCT.
+
+### A.6 Verification
+
+A decoder is compliant iff, for 10,000,000 random int32 coefficient blocks
+(all sizes 4, 8, 16, 32), its output matches the Python reference
+(`src/common/idct.py`) bit-for-bit.
