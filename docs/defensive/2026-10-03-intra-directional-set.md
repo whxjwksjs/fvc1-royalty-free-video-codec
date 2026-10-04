@@ -1,6 +1,6 @@
 # Defensive Publication — FVC1 8-mode directional intra prediction set
 
-**Date of first public disclosure:** 2026-10-03
+**Date of first public disclosure:** 2026-10-03 (commit 79bdae9, https://github.com/whxjwksjs/fvc1-royalty-free-video-codec)
 **Project:** FVC1 (Free Video Codec 1)
 
 ## Purpose

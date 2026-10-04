@@ -1,6 +1,6 @@
 # Defensive Publication — FVC1 transform, quantization, and reconstruction
 
-**Date of first public disclosure:** [TO BE SET ON PUBLICATION]
+**Date of first public disclosure:** 2026-10-03 (commit 79bdae9, https://github.com/whxjwksjs/fvc1-royalty-free-video-codec)
 **Project:** FVC1 (Free Video Codec 1)
 
 ## Purpose
