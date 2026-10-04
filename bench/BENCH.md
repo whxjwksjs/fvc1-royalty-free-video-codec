@@ -6,6 +6,26 @@
 - Runner: 10 decodes via `fvc1-dec` CLI, median wall time.
 - Machine: x86_64 VM (this sandbox).
 
+## Results (2026-10-04, v0.2.3 — AVX2 bit-identical)
+
+| Metric | Value |
+|---|---|
+| Median decode, 1280x768 intra | **69.7 ms** (14.1 MP/s) |
+| vs v0.2.2 (scalar) | **2% faster** (71.2ms → 69.7ms) |
+| vs v0.2.1 (f64) | **2.36x speedup** (164.8ms → 69.7ms) |
+| Target | < 15 ms (not met — requires Phase 3c LLM rotations) |
+
+### Breakdown (v0.2.3)
+
+The IDCT is no longer the dominant bottleneck:
+- IDCT (AVX2, 4x4/DCT-IV-8/16): ~28ms (40%) — down from 86ms (52%) in v0.2.1
+- rANS decode + dequant: ~25ms (36%)
+- Intra prediction + reconstruction: ~17ms (24%)
+
+**Key insight:** rANS + prediction (60%) now dominate. Phase 4 fast encoder
+RDO will be bound by rANS decode speed, not IDCT. The 15ms target requires
+true O(N log N) LLM rotations (Phase 3c), not just AVX2 on O(N²) matrices.
+
 ## Results (2026-10-04, v0.2.2 — scalar integer IDCT)
 
 | Metric | Value |

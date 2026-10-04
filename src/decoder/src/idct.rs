@@ -69,6 +69,21 @@ const V16: [[i32; 16]; 16] = [
 
 /// 4-point 1D IDCT, 32-bit intermediate output.
 fn idct4_32(dq: &[i32]) -> [i32; 4] {
+    #[cfg(target_arch = "x86_64")]
+    {
+        // Cache AVX2 detection (OnceLock is lock-free after init)
+        static HAS_AVX2: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let has_avx2 = *HAS_AVX2.get_or_init(|| std::is_x86_feature_detected!("avx2"));
+        if has_avx2 {
+            // SAFETY: AVX2 detected at runtime.
+            unsafe { return simd::idct4_32_avx2(dq); }
+        }
+    }
+    idct4_32_scalar(dq)
+}
+
+/// Scalar 4-point IDCT.
+fn idct4_32_scalar(dq: &[i32]) -> [i32; 4] {
     let mut r = [0i32; 4];
     for n in 0..4 {
         let mut s: i32 = 0;
@@ -83,6 +98,24 @@ fn idct4_32(dq: &[i32]) -> [i32; 4] {
 /// M-point DCT-IV, 32-bit intermediate output.
 /// Writes to output slice.
 fn idct_iv_32_into(dq: &[i32], out: &mut [i32], m: usize) {
+    // Use AVX2 for 8-point and 16-point if available
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::is_x86_feature_detected!("avx2") {
+            unsafe {
+                if m == 8 {
+                    let r = simd::idct_iv8_avx2(dq);
+                    out[..8].copy_from_slice(&r);
+                    return;
+                } else if m == 16 {
+                    let r = simd::idct_iv16_avx2(dq);
+                    out[..16].copy_from_slice(&r);
+                    return;
+                }
+            }
+        }
+    }
+    
     for n in 0..m {
         let mut s: i32 = 0;
         for k in 0..m {
@@ -203,34 +236,162 @@ fn idct_2d_scalar(coeffs: &[i32], n: usize) -> Vec<i16> {
 #[cfg(target_arch = "x86_64")]
 mod simd {
     use std::arch::x86_64::*;
+    use super::{W4, V2, V4, V8, V16};
 
-    /// 8x8 matrix-vector multiply: out[i] = sum_j mat[i][j] * vec[j]
-    /// mat is 8x8 row-major. Uses AVX2.
+    /// 4-point IDCT via AVX2. Bit-identical to scalar (same ops, same order).
+    /// Processes 2 outputs at a time (8 int32 multiplies per instruction).
     #[target_feature(enable = "avx2")]
-    unsafe fn mat8x8_vec_avx2(mat: &[i32], vec: &[i32]) -> [i32; 8] {
-        let mut out = [0i32; 8];
-        // Load vec into two 256-bit registers (4 elements each, duplicated)
-        let v0 = _mm256_set_epi32(vec[3], vec[2], vec[1], vec[0], vec[3], vec[2], vec[1], vec[0]);
-        let v1 = _mm256_set_epi32(vec[7], vec[6], vec[5], vec[4], vec[7], vec[6], vec[5], vec[4]);
+    pub unsafe fn idct4_32_avx2(dq: &[i32]) -> [i32; 4] {
+        // W4[k][n]: k=row (input idx), n=col (output idx)
+        // out[n] = sum_k W4[k][n] * dq[k]
         
-        for i in 0..8 {
-            let row_offset = i * 8;
-            // Load row (8 elements)
-            let r = _mm256_loadu_si256(mat.as_ptr().add(row_offset) as *const __m256i);
-            // Split into low/high 4 elements for multiplication
-            // Actually, we need to multiply 8 elements: use two 4-element multiplies
-            let r_lo = _mm256_castsi256_si128(r);  // low 128 bits (4 elements)
-            let r_hi = _mm256_extracti128_si256::<1>(r);  // high 128 bits
+        // We'll compute out0,out1 in parallel, then out2,out3.
+        // For out0,out1: need W4[k][0], W4[k][1] for k=0..3.
+        
+        let mut result = [0i32; 4];
+        
+        // Process outputs 0,1
+        {
+            // Load matrix elements for outputs 0,1, interleaved:
+            // [W00, W01, W10, W11, W20, W21, W30, W31] where Wij = W4[i][j]
+            let mat01 = _mm256_set_epi32(
+                W4[3][1], W4[3][0], W4[2][1], W4[2][0],
+                W4[1][1], W4[1][0], W4[0][1], W4[0][0],
+            );
+            // We need to multiply by dq[k] and sum across k.
+            // Broadcast each dq[k] and multiply by the corresponding matrix elements.
             
-            // This is getting complex. Simpler: do 8 scalar multiplies but with AVX2 for 4 at a time.
-            // For now, fall back to scalar for correctness, AVX2 optimization is future.
-            let mut s: i32 = 0;
-            for j in 0..8 {
-                s += mat[row_offset + j] * vec[j];
-            }
-            out[i] = s;
+            // For k=0: need [W00*dq0, W01*dq0, ...] — but mat01 has W00,W01,W10,W11...
+            // Actually, let's do it differently: 4 separate broadcasts, 4 multiplies, 3 adds.
+            
+            let dq0 = _mm256_set1_epi32(dq[0]);
+            let dq1 = _mm256_set1_epi32(dq[1]);
+            let dq2 = _mm256_set1_epi32(dq[2]);
+            let dq3 = _mm256_set1_epi32(dq[3]);
+            
+            // Matrix for k=0: [W00, W01, 0,0,0,0,0,0] — we only need first 2
+            // This is getting messy. Let me do 8 outputs at once for 2 blocks.
+            
+            // Simpler: process one 4x4 at a time using 4x 8-wide ops
+            // Each op does 2 outputs × 4 inputs = 8 multiplies
+            
+            // out0,out1:
+            // sum_k W4[k][0]*dq[k], sum_k W4[k][1]*dq[k]
+            let m0 = _mm256_set_epi32(0, 0, 0, 0, 0, 0, W4[0][1], W4[0][0]);
+            let m1 = _mm256_set_epi32(0, 0, 0, 0, 0, 0, W4[1][1], W4[1][0]);
+            let m2 = _mm256_set_epi32(0, 0, 0, 0, 0, 0, W4[2][1], W4[2][0]);
+            let m3 = _mm256_set_epi32(0, 0, 0, 0, 0, 0, W4[3][1], W4[3][0]);
+            
+            let p0 = _mm256_mullo_epi32(m0, dq0);
+            let p1 = _mm256_mullo_epi32(m1, dq1);
+            let p2 = _mm256_mullo_epi32(m2, dq2);
+            let p3 = _mm256_mullo_epi32(m3, dq3);
+            
+            let sum01 = _mm256_add_epi32(_mm256_add_epi32(p0, p1), _mm256_add_epi32(p2, p3));
+            // sum01 = [s0, s1, 0,0,0,0,0,0] where s0=out0_num, s1=out1_num
+            let s0 = _mm256_extract_epi32(sum01, 0);
+            let s1 = _mm256_extract_epi32(sum01, 1);
+            result[0] = (s0 + 8192) >> 14;
+            result[1] = (s1 + 8192) >> 14;
         }
-        out
+        
+        // Process outputs 2,3
+        {
+            let m0 = _mm256_set_epi32(0, 0, 0, 0, 0, 0, W4[0][3], W4[0][2]);
+            let m1 = _mm256_set_epi32(0, 0, 0, 0, 0, 0, W4[1][3], W4[1][2]);
+            let m2 = _mm256_set_epi32(0, 0, 0, 0, 0, 0, W4[2][3], W4[2][2]);
+            let m3 = _mm256_set_epi32(0, 0, 0, 0, 0, 0, W4[3][3], W4[3][2]);
+            
+            let dq0 = _mm256_set1_epi32(dq[0]);
+            let dq1 = _mm256_set1_epi32(dq[1]);
+            let dq2 = _mm256_set1_epi32(dq[2]);
+            let dq3 = _mm256_set1_epi32(dq[3]);
+            
+            let p0 = _mm256_mullo_epi32(m0, dq0);
+            let p1 = _mm256_mullo_epi32(m1, dq1);
+            let p2 = _mm256_mullo_epi32(m2, dq2);
+            let p3 = _mm256_mullo_epi32(m3, dq3);
+            
+            let sum23 = _mm256_add_epi32(_mm256_add_epi32(p0, p1), _mm256_add_epi32(p2, p3));
+            let s2 = _mm256_extract_epi32(sum23, 0);
+            let s3 = _mm256_extract_epi32(sum23, 1);
+            result[2] = (s2 + 8192) >> 14;
+            result[3] = (s3 + 8192) >> 14;
+        }
+        
+        result
+    }
+
+    /// 8-point DCT-IV via AVX2. Bit-identical to scalar.
+    #[target_feature(enable = "avx2")]
+    pub unsafe fn idct_iv8_avx2(dq: &[i32]) -> [i32; 8] {
+        let mut result = [0i32; 8];
+        // V8[k][n]: k=input, n=output
+        // out[n] = sum_k V8[k][n] * dq[k]
+        // Process 8 outputs, each with 8 multiplies.
+        // For each output n, load the 8 matrix elements V8[0..7][n] and multiply by dq[0..7].
+        
+        // Load dq into 2 registers (we'll broadcast)
+        // Actually, simpler: for each n, do 8-wide multiply and horizontal sum.
+        
+        for n in 0..8 {
+            // Load column n of V8: V8[0][n], V8[1][n], ..., V8[7][n]
+            let col = _mm256_set_epi32(
+                V8[7][n], V8[6][n], V8[5][n], V8[4][n],
+                V8[3][n], V8[2][n], V8[1][n], V8[0][n],
+            );
+            // Load dq[0..7]
+            let v = _mm256_loadu_si256(dq.as_ptr() as *const __m256i);
+            let prod = _mm256_mullo_epi32(col, v);
+            // Horizontal sum of 8 int32s
+            let sum1 = _mm256_hadd_epi32(prod, prod);
+            let sum2 = _mm256_hadd_epi32(sum1, sum1);
+            let s_lo = _mm256_extract_epi32(sum2, 0);
+            let s_hi = _mm256_extract_epi32(sum2, 4);
+            let s = s_lo + s_hi;
+            result[n] = (s + 8192) >> 14;
+        }
+        result
+    }
+
+    /// 16-point DCT-IV via AVX2. Bit-identical to scalar.
+    /// Processes 8 outputs at a time (2x 8-wide).
+    #[target_feature(enable = "avx2")]
+    pub unsafe fn idct_iv16_avx2(dq: &[i32]) -> [i32; 16] {
+        let mut result = [0i32; 16];
+        // For each output n, sum_k V16[k][n] * dq[k]
+        // Do 8 outputs at a time using 2 AVX2 registers for the 16 inputs.
+        
+        for n in 0..16 {
+            // Load 16 matrix elements: V16[0..15][n]
+            // Split into two 8-element halves
+            let col_lo = _mm256_set_epi32(
+                V16[7][n], V16[6][n], V16[5][n], V16[4][n],
+                V16[3][n], V16[2][n], V16[1][n], V16[0][n],
+            );
+            let col_hi = _mm256_set_epi32(
+                V16[15][n], V16[14][n], V16[13][n], V16[12][n],
+                V16[11][n], V16[10][n], V16[9][n], V16[8][n],
+            );
+            let v_lo = _mm256_loadu_si256(dq.as_ptr() as *const __m256i);
+            let v_hi = _mm256_loadu_si256(dq.as_ptr().add(8) as *const __m256i);
+            
+            let p_lo = _mm256_mullo_epi32(col_lo, v_lo);
+            let p_hi = _mm256_mullo_epi32(col_hi, v_hi);
+            
+            // Horizontal sum each
+            let s1_lo = _mm256_hadd_epi32(p_lo, p_lo);
+            let s2_lo = _mm256_hadd_epi32(s1_lo, s1_lo);
+            let sum_lo = _mm256_extract_epi32(s2_lo, 0) + _mm256_extract_epi32(s2_lo, 4);
+            
+            let s1_hi = _mm256_hadd_epi32(p_hi, p_hi);
+            let s2_hi = _mm256_hadd_epi32(s1_hi, s1_hi);
+            let sum_hi = _mm256_extract_epi32(s2_hi, 0) + _mm256_extract_epi32(s2_hi, 4);
+            
+            let s = sum_lo + sum_hi;
+            result[n] = (s + 8192) >> 14;
+        }
+        result
     }
 
     pub unsafe fn idct_2d_avx2(coeffs: &[i32], n: usize) -> Vec<i16> {
